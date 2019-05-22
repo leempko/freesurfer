@@ -9,7 +9,7 @@ from freesurfer.samseg.utilities import requireNumpyArray, Specification
 from freesurfer.samseg.bias_correction import projectKroneckerProductBasisFunctions, backprojectKroneckerProductBasisFunctions, \
     computePrecisionOfKroneckerProductBasisFunctions
 from freesurfer.samseg.register_atlas import registerAtlas
-from mcmcVAE import sampleVAE
+from freesurfer.samseg.mcmcVAE import sampleVAE
 import logging
 import pickle
 
