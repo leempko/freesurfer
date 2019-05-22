@@ -9,6 +9,7 @@ from freesurfer.samseg.utilities import requireNumpyArray, Specification
 from freesurfer.samseg.bias_correction import projectKroneckerProductBasisFunctions, backprojectKroneckerProductBasisFunctions, \
     computePrecisionOfKroneckerProductBasisFunctions
 from freesurfer.samseg.register_atlas import registerAtlas
+from mcmcVAE import sampleVAE
 import logging
 import pickle
 
@@ -1217,7 +1218,7 @@ def writeResults( imageFileNames, savePath, imageBuffers, mask, biasFields, post
     volumesInCubicMm = ( np.sum( posteriors, axis=0 ) ) * volumeOfOneVoxel
 
 
-    return volumesInCubicMm
+    return volumesInCubicMm, freeSurferSegmentation
   
 
 def saveDeformedAtlas( originalAtlasFileName, deformedAtlasFileName, arg, applyAsDeformation=False ):
@@ -1236,10 +1237,65 @@ def saveDeformedAtlas( originalAtlasFileName, deformedAtlasFileName, arg, applyA
     return
 
 
+def getLesionIndexes( mergedNames ):
+    # Make sure there is a lesion class (and only one), and get the index
+    exist = [s for s in mergedNames if "Lesions".lower() in s.lower()]
+    if not exist:
+        print('There seems to be no lesion class to model, exit')
+        exit()
+    if len(exist) > 1:
+        print('There seems to be more than one lesion class, exit')
+        exit()
+    lesion_idx = mergedNames.index(exist[0])
+
+    # Check where the gray matter class is, try a couple of different names
+    exist = [s for s in mergedNames if "gm".lower() in s.lower()]
+    if not exist:
+        exist = [s for s in mergedNames if "gray matter".lower() in s.lower()]
+        if not exist:
+            exist = [s for s in mergedNames if "gray_matter".lower() in s.lower()]
+            if not exist:
+                print('Cannot find a gray matter class, tried names: "GM", "Gray matter", "Gray_matter", exit')
+                exit()
+    gm_idx = mergedNames.index(exist[0])
+
+    return lesion_idx, gm_idx
+
+
+def setLesionHyperparameters( imageBuffers, mask, modelSpecifications, optimizationOptions, lesion_idx,
+                              voxelSpacing, transform, biasFieldBasisFunctions, numberOfGaussiansPerClass  ):
+    downSamplingFactors = np.uint32(np.round(optimizationOptions['multiResolutionSpecification'][0]
+                                            ['targetDownsampledVoxelSpacing'] / voxelSpacing))
+    downSamplingFactors[downSamplingFactors < 1] = 1
+    downSampledImageBuffers, downSampledMask, downSampledMesh, _, _, _ = \
+        getDownSampledModel(imageBuffers, mask,
+                            optimizationOptions['multiResolutionSpecification'][0]['atlasFileName'],
+                            modelSpecifications.K, transform, biasFieldBasisFunctions,
+                            downSamplingFactors)
+    tmp = downSampledMesh.rasterize_2(downSampledMask.shape, -1)
+    downSampledClassPriors = tmp[downSampledMask] / 65535
+    means, variances, mixtureWeights = initializeGMMParameters(downSampledImageBuffers[downSampledMask, :],
+                                                               downSampledClassPriors, numberOfGaussiansPerClass,
+                                                               modelSpecifications.useDiagonalCovarianceMatrices)
+
+
+    gaussianNumbers_lesions = [sum(numberOfGaussiansPerClass[0:lesion_idx])]
+    hyperMeansLesion = means[gaussianNumbers_lesions]
+    hyperMeansNumberOfMeasurementsLesion = 100
+    hyperVariancesNumberOfMeasurementsLesion = 500
+    dataMean = np.mean(downSampledImageBuffers[downSampledMask, :])
+    tmp = downSampledImageBuffers[downSampledMask, :] - dataMean
+    dataVariance = np.var(tmp, axis=0)
+    wideFactor = 200
+    hyperVariancesLesion = wideFactor * np.diag(dataVariance) / hyperVariancesNumberOfMeasurementsLesion
+
+    return hyperMeansLesion, hyperMeansNumberOfMeasurementsLesion,\
+           hyperVariancesLesion, hyperVariancesNumberOfMeasurementsLesion
+
 
 def samsegment( imageFileNames, atlasDir, savePath,
                 transformedTemplateFileName=None, 
-                userModelSpecifications={}, userOptimizationOptions={},
+                userModelSpecifications={}, userOptimizationOptions={}, lesionOptions = {},
                 visualizer=None, saveHistory=False, saveMesh=False,
                 targetIntensity=None, targetSearchStrings=None ):
 
@@ -1351,16 +1407,51 @@ def samsegment( imageFileNames, atlasDir, savePath,
     #   - classFractions -> a numberOfClasses x numberOfStructures table indicating in each column the mixing weights of the
     #                       various classes in the corresponding structure
     numberOfGaussiansPerClass = [ param.numberOfComponents for param in modelSpecifications.sharedGMMParameters ]
-    classFractions, _ = gems.kvlGetMergingFractionsTable( modelSpecifications.names, modelSpecifications.sharedGMMParameters )
+    classFractions, mergedNames = gems.kvlGetMergingFractionsTable( modelSpecifications.names, modelSpecifications.sharedGMMParameters )
 
 
-    # 
-    means, variances, mixtureWeights, biasFieldCoefficients, \
-      deformation, deformationAtlasFileName, optimizationSummary, optimizationHistory = \
-            estimateModelParameters( imageBuffers, mask, biasFieldBasisFunctions, transform, voxelSpacing,
+
+    # If segment lesion option is on, set hyperparameters for lesion gaussian
+    if lesionOptions['segmentLesion']:
+        lesion_idx, gm_idx = getLesionIndexes(mergedNames)
+
+
+        # Get initial parameters for lesion hyperprior initialization
+        hyperMeansLesion, hyperMeansNumberOfMeasurementsLesion,\
+        hyperVariancesLesion, hyperVariancesNumberOfMeasurementsLesion = setLesionHyperparameters(imageBuffers, mask,
+                               modelSpecifications, optimizationOptions, lesion_idx,
+                              voxelSpacing, transform, biasFieldBasisFunctions, numberOfGaussiansPerClass )
+
+        numberOfGaussians = sum(numberOfGaussiansPerClass)
+        numberOfContrasts = imageBuffers.shape[3]
+        gaussianNumbers_lesions = [sum(numberOfGaussiansPerClass[0:lesion_idx])]
+        gaussianNumbers_gray = [sum(numberOfGaussiansPerClass[0:gm_idx])]
+
+        hyperMeans = np.zeros( ( numberOfGaussians, numberOfContrasts ) )
+        hyperMeans[gaussianNumbers_lesions] = hyperMeansLesion
+        hyperMeansNumberOfMeasurements = np.zeros( numberOfGaussians )
+        hyperMeansNumberOfMeasurements[gaussianNumbers_lesions] = hyperMeansNumberOfMeasurementsLesion
+        hyperVariancesNumberOfMeasurements = np.zeros(numberOfGaussians)
+        hyperVariancesNumberOfMeasurements[gaussianNumbers_lesions] = hyperVariancesNumberOfMeasurementsLesion
+        hyperVariances = np.tile(np.eye(numberOfContrasts), (numberOfGaussians, 1, 1))
+        hyperVariances[gaussianNumbers_lesions, :, :] = hyperVariancesLesion
+
+        means, variances, mixtureWeights, biasFieldCoefficients, \
+        deformation, deformationAtlasFileName, optimizationSummary, optimizationHistory = \
+            estimateModelParameters(imageBuffers, mask, biasFieldBasisFunctions, transform, voxelSpacing,
                                     modelSpecifications.K, modelSpecifications.useDiagonalCovarianceMatrices,
                                     classFractions, numberOfGaussiansPerClass, optimizationOptions,
-                                    saveHistory=saveHistory, visualizer=visualizer )
+                                    hyperMeans=hyperMeans, hyperMeansNumberOfMeasurements=hyperMeansNumberOfMeasurements,
+                                    hyperVariances=hyperVariances, hyperVariancesNumberOfMeasurements=hyperMeansNumberOfMeasurements,
+                                    saveHistory=saveHistory, visualizer=visualizer)
+
+    else:
+        means, variances, mixtureWeights, biasFieldCoefficients, \
+        deformation, deformationAtlasFileName, optimizationSummary, optimizationHistory = \
+                estimateModelParameters( imageBuffers, mask, biasFieldBasisFunctions, transform, voxelSpacing,
+                                        modelSpecifications.K, modelSpecifications.useDiagonalCovarianceMatrices,
+                                        classFractions, numberOfGaussiansPerClass, optimizationOptions,
+                                        saveHistory=saveHistory, visualizer=visualizer )
 
 
     # =======================================================================================
@@ -1377,9 +1468,41 @@ def samsegment( imageFileNames, atlasDir, savePath,
                                                     numberOfGaussiansPerClass, classFractions )
 
     # Write out segmentation and bias field corrected volumes
-    volumesInCubicMm = writeResults( imageFileNames, savePath, imageBuffers, mask, biasFields, posteriors, 
-                                    modelSpecifications.FreeSurferLabels, cropping,
+    volumesInCubicMm, freeSurferSegmentation = writeResults( imageFileNames, savePath, imageBuffers, mask, biasFields,
+                                    posteriors, modelSpecifications.FreeSurferLabels, cropping,
                                     targetIntensity, targetSearchStrings, modelSpecifications.names )
+
+    # If segment lesion flag is on, call the mcmc sampler
+    if lesionOptions['segmentLesion']:
+
+        # Get the lesion segmentation, we use this to initialize sampling, the lesion label is 99,
+        # get the index as well so we don't need to assume it's the last structure in the atlas
+        lesion_init = np.where(freeSurferSegmentation == 99)
+        lesion_atlas_idx = modelSpecifications.FreeSurferLabels.index(99)
+
+        biasFields = getBiasFields(biasFieldCoefficients, biasFieldBasisFunctions)
+        data = imageBuffers[mask, :] - biasFields[mask, :]
+
+        imageSize = imageBuffers.shape[0:3]
+
+        # Get the final mesh
+        mesh = getMesh(modelSpecifications.atlasFileName, transform,
+                       initialDeformation=deformation,
+                       initialDeformationMeshCollectionFileName=deformationAtlasFileName)
+
+        # Get the priors as dictated by the current mesh position
+        priors = mesh.rasterize(imageBuffers.shape[0:3], -1)
+        priors = priors[mask, :]
+
+        # Model path
+        modelPath = os.getcwd() + '/VAE'
+        sampleVAE(lesionOptions, imageSize, modelPath, mask, priors, lesion_atlas_idx,
+                  data, lesion_init, savePath, voxelSpacing, modelSpecifications.FreeSurferLabels, gaussianNumbers_gray[0],
+                  cropping, imageFileNames, modelSpecifications.names, means, variances, mixtureWeights,
+                  hyperMeansLesion, hyperVariancesLesion, hyperMeansNumberOfMeasurementsLesion,
+                  hyperVariancesNumberOfMeasurementsLesion, numberOfGaussiansPerClass,
+                  gaussianNumbers_lesions[0], posteriors, classFractions,
+                  modelSpecifications.useDiagonalCovarianceMatrices)
 
 
     # Save the final mesh collection

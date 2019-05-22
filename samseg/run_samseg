@@ -23,6 +23,14 @@ parser.add_argument('-r', '--reg-mat', metavar='FILE', help='Skip initial affine
 parser.add_argument('--init-lta', metavar='FILE', help='Initial affine registration.')
 parser.add_argument('-a', '--atlas', metavar='DIR', help='Point to an alternative atlas directory.')
 parser.add_argument('--options', metavar='FILE', help='Override advanced options via a json file.')
+# optional white-matter lesion segmentation options
+parser.add_argument('--segment-lesion', action='store_true', default=False, help='Segment also white-matter lesions')
+parser.add_argument('--lesion-mask', nargs='+', default='0', help='Lesion mask vector (1 value for each input): -1 means below GM mean, +1 above, 0 no mask')
+parser.add_argument('--threshold', type=float, default=0.5, help='Lesion threshold')
+parser.add_argument('--number-samples', type=int, default=50, help='Number of samples from the VAE')
+parser.add_argument('--burn-in-samples', type=int, default=50, help='Number of burn-in-samples from the VAE')
+parser.add_argument('--save-posteriors', action='store_true', default=False, help='Save structures posteriors')
+
 # optional debugging options
 parser.add_argument('--history', action='store_true', default=False, help='Save history.')
 parser.add_argument('--showfigs', action='store_true', default=False, help='Show figures during run.')
@@ -110,6 +118,15 @@ if args.options:
         userModelSpecifications = userOptions.get( 'modelSpecifications' )
     if userOptions.get( 'optimizationOptions' ) is not None: 
         userOptimizationOptions = userOptions.get( 'optimizationOptions' )
+# If segment lesion flag is on save lesion specification
+lesionOptions = {
+    'segmentLesion': args.segment_lesion,  # segment lesion boolean
+    'threshold': args.threshold,  # threshold for the lesion
+    'samplingSteps': args.number_samples,  # number of samples from the VAE for modelling lesion shape
+    'burnInSteps': args.burn_in_samples,  # number of burn-in steps from the VAE for modelling lesion shape
+    'lesionMask': args.lesion_mask,  # lesion masks -1 below WM mean, +1 above WM mean, 0 no mask
+    'savePosteriors': args.save_posteriors,  # save posteriors images
+}
 
 # ------ Run Samsegment ------
 
@@ -120,6 +137,7 @@ labels, names, volumes, optimizationSummary = \
                 transformedTemplateFileName=transformedTemplateFileName, 
                 userModelSpecifications=userModelSpecifications, 
                 userOptimizationOptions=userOptimizationOptions,
+                lesionOptions=lesionOptions,
                 visualizer=visualizer, saveHistory=args.history, saveMesh=args.save_mesh,
                 targetIntensity=110, targetSearchStrings=[ 'Cerebral-White-Matter' ] )
 
